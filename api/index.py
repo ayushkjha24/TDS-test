@@ -1,74 +1,55 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
+import numpy as np
+import json
+import os
 
-from pydantic import BaseModel
+app = FastAPI()
 
-
-app = FastAPI(debug=True)
-
+# Enable CORS for POST from any origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    # Allows all origins
-    allow_methods=["*"],
+    allow_origins=["*"],
+    allow_methods=["POST"],
     allow_headers=["*"],
-    expose_headers=["*"]    # Expose all the headers to the browser in response
 )
 
+# Load sample telemetry once at startup
+with open(os.path.join(os.path.dirname(__file__), "..", "q-vercel-latency.json")) as f:
+    telemetry = json.load(f)
 
-class CheckRequest(BaseModel):
-    regions: List[str]
-    threshold_ms: int
+@app.post("/")
+async def check_latency(req: Request):
+    body = await req.json()
+    regions = body.get("regions", [])
+    threshold = body.get("threshold_ms", 180)
 
-
-# REQUEST:->         {"regions":["amer","emea"],"threshold_ms":152}
-# RESPONSE:->        {"regions":{"amer":{"avg_latency":176.27,"p95":220.86,"avg_uptime":97.98,"breaches":9},"emea":{"avg_latency":177.2,"p95":218.3,"avg_uptime":98.5,"breaches":8}}}
-
-@app.post("/check")
-def check(data: CheckRequest):
-    regions = data.regions
-    threshold_ms = data.threshold_ms
-
-    import json
-    import os
-
-    file = "q-vercel-latency.json"
-    path = os.path.join(os.path.dirname(__file__), file)
-    with open(path, "r") as f:
-        telemetry = json.load(f)
-
-    result = {}
+    results = {}
 
     for region in regions:
-        latency_sum = 0
-        uptime_sum = 0
-        breaches = 0
-        count = 0
+        records = telemetry.get(region, [])
+        if not records:
+            results[region] = {
+                "avg_latency": None,
+                "p95_latency": None,
+                "avg_uptime": None,
+                "breaches": 0,
+            }
+            continue
 
-        for entry in telemetry:
-            if entry["region"] == region:
-                latency_sum += entry["latency_ms"]
-                uptime_sum += entry["uptime_pct"]
-                count += 1
-                if entry["latency_ms"] > threshold_ms:
-                    breaches += 1
+        latencies = [r["latency_ms"] for r in records]
+        uptimes = [r["uptime"] for r in records]
 
-        avg_latency = round(latency_sum / count, 2) if count else 0
-        avg_uptime = round(uptime_sum / count, 2) if count else 0
-        import numpy as np
+        avg_latency = float(np.mean(latencies))
+        p95_latency = float(np.percentile(latencies, 95))
+        avg_uptime = float(np.mean(uptimes))
+        breaches = int(sum(1 for l in latencies if l > threshold))
 
-        region_latencies = [e["latency_ms"] for e in telemetry if e["region"] == region]
-        p95 = np.percentile(region_latencies, 95) if region_latencies else 0
-
-        result[region] = {
-            "avg_latency": round(avg_latency, 2),
-            "p95": round(p95, 2),
-            "avg_uptime": round(avg_uptime, 2),
+        results[region] = {
+            "avg_latency": avg_latency,
+            "p95_latency": p95_latency,
+            "avg_uptime": avg_uptime,
             "breaches": breaches,
         }
-    return {"regions": result}
 
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return results
